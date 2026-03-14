@@ -9,6 +9,7 @@ __pycache__/
 # Local
 .agents/
 .claude/
+CLAUDE.md
 
 # Distribution / packaging
 .Python
