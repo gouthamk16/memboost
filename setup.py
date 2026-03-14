@@ -8,7 +8,7 @@ cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 setup(
     name="memboost",
     version="0.1.0",
-    description="2-bit quantization for LLM inference",
+    description="Mixed-precision 2/4-bit weight quantization engine for LLMs",
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=["numpy"],

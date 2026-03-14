@@ -1,24 +1,22 @@
-/* Generally - weights are rerpresented in fp16 (16 bits)
+/* Generally - weights are represented in fp16 (16 bits)
  What we plan to do now - represent weights in int2 (2 bits)
 
  Goal of this file:  Take weights in fp16 and convert them to int2
  Algo: Intra-matrix mixed-precision quantization based on: "Fast and Efficient 2-bit LLM Inference on GPU" (arxiv 2311.16442)
 
  Quantization basic theory
-A group of weightsd with range (min, max) can be quantized to int2 (2 bits) in the range of (0, 2^N-1), zero point(N bits int) and scale factor(half)
+A group of weights with range (min, max) can be quantized to int2 (2 bits) in the range of (0, 2^N-1), zero point(N bits int) and scale factor(half)
 
 Components:
  1. Intra-weight mixed-precision quantization (2/4-bit)
- 2. Asynchronous dequantization with GEMV
- 3. Sparse outlier handling (CSR + cuSPARSE)
+ 2. Hierarchical 2nd-order scale quantization
+ 3. Sparse outlier detection and extraction (CSR format)
+ 4. Dequantization for roundtrip verification
 */
 
 #include "quantize.cuh"
 #include <cuda_fp16.h>
-#include <cooperative_groups.h>
 #include <cstdio>
-
-namespace cg = cooperative_groups;
 
 namespace memboost {
 
@@ -203,8 +201,9 @@ __global__ void quantize_weights_kernel(
         packed_2bit[row * num_groups + group_idx] = pack_2bit(quant_vals);
         
     } else {
-        // 4-bit quantization
-        uint8_t quant_vals[8] = {0};
+        // 4-bit quantization — 16 values per group, packed into 2 uint32 words
+        uint8_t quant_vals_lo[8] = {0};  // first 8 values
+        uint8_t quant_vals_hi[8] = {0};  // second 8 values
         
         for (int i = 0; i < min(8, group_size); i++) {
             int col = col_start + i;
@@ -212,7 +211,7 @@ __global__ void quantize_weights_kernel(
             
             int q = (int)roundf((w - gmin) / scale);
             q = max(0, min(15, q));
-            quant_vals[i] = (uint8_t)q;
+            quant_vals_lo[i] = (uint8_t)q;
 
             // Check for outliers
             float w_dequant = scale * (q - zero);
@@ -222,7 +221,23 @@ __global__ void quantize_weights_kernel(
             }
         }
         
-        packed_4bit[row * num_groups + group_idx] = pack_4bit(quant_vals);
+        for (int i = 8; i < min(16, group_size); i++) {
+            int col = col_start + i;
+            float w = hto_float(weights[row * K + col]);
+            
+            int q = (int)roundf((w - gmin) / scale);
+            q = max(0, min(15, q));
+            quant_vals_hi[i - 8] = (uint8_t)q;
+
+            float w_dequant = scale * (q - zero);
+            float error = fabsf(w - w_dequant);
+            if (error > outlier_thresh) {
+                atomicOr(&outlier_mask[row * K + col], 1);
+            }
+        }
+        
+        packed_4bit[row * num_groups * 2 + group_idx * 2]     = pack_4bit(quant_vals_lo);
+        packed_4bit[row * num_groups * 2 + group_idx * 2 + 1] = pack_4bit(quant_vals_hi);
     }
 }
 
@@ -262,128 +277,6 @@ __global__ void quantize_scales_2nd_order_kernel(
         int q = (int)roundf((s - min_s) / scale_2nd);
         q = max(0, min(15, q));
         scales_1st_quant[i] = (uint8_t)q;
-    }
-}
-
-// Asynchronous Dequantization + GEMV Kernel
-/*
-Key optimizations from paper:
-1. Overlap 2nd order scale dequant with weight loading (shared mem)
-2. Vectorized loads (float4/double4)
-3. __shfl_down_sync for warp reduction
-*/
-__global__ void async_dequant_gemv_kernel(
-    const uint32_t* __restrict__ packed_weights,
-    const uint8_t* __restrict__ group_precision,
-    const uint8_t* __restrict__ scales_1st_quant,
-    const int8_t* __restrict__ zeros_1st,
-    const half* __restrict__ scales_2nd,
-    const int8_t* __restrict__ zeros_2nd,
-    const half* __restrict__ input,
-    half* __restrict__ output,
-    int M, int K, int num_groups
-) {
-    extern __shared__ char shared_mem[];
-    
-    // Shared memory for dequantized scales
-    half* s_scales = (half*)shared_mem;
-    
-    int row = blockIdx.x;
-    int tid = threadIdx.x;
-    int warp_id = tid / WARP_SIZE;
-    int lane_id = tid % WARP_SIZE;
-    
-    if (row >= M) return;
-    
-    float acc = 0.0f;
-    
-    // Process groups in tiles
-    for (int g2 = 0; g2 < (num_groups + GROUP_SIZE_2ND - 1) / GROUP_SIZE_2ND; g2++) {
-        
-        // Load 2nd order params to shared mem
-        int g2_start = g2 * GROUP_SIZE_2ND;
-        
-        // Async: Dequantize 2nd order scales while loading weights
-        if (tid < GROUP_SIZE_2ND && g2_start + tid < num_groups) {
-            int scale_idx = row * num_groups + g2_start + tid;
-            
-            // 2nd order dequantization
-            int g2_idx = scale_idx / GROUP_SIZE_2ND;
-            float s2 = hto_float(scales_2nd[g2_idx]);
-            int z2 = zeros_2nd[g2_idx];
-            
-            float s1_dequant = s2 * ((float)scales_1st_quant[scale_idx] - z2);
-            s_scales[tid] = float_to_half(s1_dequant);
-        }
-        __syncthreads();
-        
-        // Process groups with dequantized scales
-        for (int g_local = tid; g_local < GROUP_SIZE_2ND; g_local += blockDim.x) {
-            int group_idx = g2_start + g_local;
-            if (group_idx >= num_groups) break;
-            
-            int col_start = group_idx * GROUP_SIZE_1ST;
-            
-            // Get dequantized scale and zero
-            float scale = hto_float(s_scales[g_local]);
-            int zero = zeros_1st[row * num_groups + group_idx];
-            
-            uint8_t precision = group_precision[group_idx];
-            
-            // Load packed weights
-            uint32_t packed = packed_weights[row * num_groups + group_idx];
-            
-            if (precision == 0) {
-                // 2-bit: unpack and dequantize
-                uint8_t vals[16];
-                unpack_2bit(packed, vals);
-                
-                #pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    if (col_start + i < K) {
-                        float w = scale * ((float)vals[i] - zero);
-                        float x = hto_float(input[col_start + i]);
-                        acc += w * x;
-                    }
-                }
-            } else {
-                // 4-bit: unpack and dequantize
-                uint8_t vals[8];
-                unpack_4bit(packed, vals);
-                
-                #pragma unroll
-                for (int i = 0; i < 8; i++) {
-                    if (col_start + i < K) {
-                        float w = scale * ((float)vals[i] - zero);
-                        float x = hto_float(input[col_start + i]);
-                        acc += w * x;
-                    }
-                }
-            }
-        }
-        __syncthreads();
-    }
-    
-    // Warp reduction using shuffle
-    #pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
-        acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
-    }
-    
-    // First thread in each warp writes to shared mem
-    if (lane_id == 0) {
-        s_scales[warp_id] = float_to_half(acc);
-    }
-    __syncthreads();
-    
-    // Final reduction across warps
-    if (tid == 0) {
-        float sum = 0.0f;
-        int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
-        for (int i = 0; i < num_warps; i++) {
-            sum += hto_float(s_scales[i]);
-        }
-        output[row] = float_to_half(sum);
     }
 }
 
@@ -446,35 +339,6 @@ cudaError_t compute_group_sensitivity(
     return cudaGetLastError();
 }
 
-cudaError_t async_dequant_gemv(
-    const QuantizedTensor* qweight,
-    const half* input,
-    half* output,
-    int M, int K,
-    cudaStream_t stream
-) {
-    int num_groups = (K + GROUP_SIZE_1ST - 1) / GROUP_SIZE_1ST;
-    
-    // One block per output row
-    dim3 grid(M);
-    dim3 block(256);
-    size_t shared_size = (GROUP_SIZE_2ND + K) * sizeof(half);
-    
-    async_dequant_gemv_kernel<<<grid, block, shared_size, stream>>>(
-        qweight->weights.weights_2bit,
-        qweight->weights.group_precision,
-        (uint8_t*)qweight->weights.scales_1st, // Already quantized
-        qweight->weights.zeros_1st,
-        qweight->weights.scales_2nd,
-        qweight->weights.zeros_2nd,
-        input,
-        output,
-        M, K, num_groups
-    );
-    
-    return cudaGetLastError();
-}
-
 cudaError_t allocate_quantized_tensor(QuantizedTensor* tensor, int M, int K) {
     tensor->M = M;
     tensor->K = K;
@@ -486,7 +350,7 @@ cudaError_t allocate_quantized_tensor(QuantizedTensor* tensor, int M, int K) {
     
     // Allocate weight storage
     cudaMalloc(&tensor->weights.weights_2bit, M * num_groups * sizeof(uint32_t));
-    cudaMalloc(&tensor->weights.weights_4bit, M * num_groups * sizeof(uint32_t));
+    cudaMalloc(&tensor->weights.weights_4bit, M * num_groups * 2 * sizeof(uint32_t));
     
     // Allocate scales and zeros
     cudaMalloc(&tensor->weights.scales_1st, M * num_groups * sizeof(half));
@@ -555,15 +419,25 @@ __global__ void dequantize_weights_kernel(
             }
         }
     } else {
-        uint32_t packed = packed_4bit[row * num_groups + group_idx];
-        uint8_t vals[8];
-        unpack_4bit(packed, vals);
+        // 4-bit: 2 uint32 words per group (first 8 + second 8 values)
+        uint32_t packed_lo = packed_4bit[row * num_groups * 2 + group_idx * 2];
+        uint32_t packed_hi = packed_4bit[row * num_groups * 2 + group_idx * 2 + 1];
+        uint8_t vals_lo[8], vals_hi[8];
+        unpack_4bit(packed_lo, vals_lo);
+        unpack_4bit(packed_hi, vals_hi);
 
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             if (col_start + i < K) {
-                float w = scale * ((float)vals[i] - zero);
+                float w = scale * ((float)vals_lo[i] - zero);
                 output[row * K + col_start + i] = float_to_half(w);
+            }
+        }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (col_start + 8 + i < K) {
+                float w = scale * ((float)vals_hi[i] - zero);
+                output[row * K + col_start + 8 + i] = float_to_half(w);
             }
         }
     }
@@ -679,34 +553,6 @@ cudaError_t dequantize_weights(
 using memboost::GROUP_SIZE_1ST;
 using memboost::GROUP_SIZE_2ND;
 using memboost::WARP_SIZE;
-
-// Reference FP16 GEMV on CPU for comparison
-void reference_gemv_cpu(const half* weights, const half* input, float* output, int M, int K) {
-    for (int row = 0; row < M; row++) {
-        float acc = 0.0f;
-        for (int col = 0; col < K; col++) {
-            acc += __half2float(weights[row * K + col]) * __half2float(input[col]);
-        }
-        output[row] = acc;
-    }
-}
-
-// Reference FP16 GEMV kernel on GPU
-__global__ void reference_gemv_kernel(
-    const half* __restrict__ weights,
-    const half* __restrict__ input,
-    half* __restrict__ output,
-    int M, int K
-) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= M) return;
-    
-    float acc = 0.0f;
-    for (int col = 0; col < K; col++) {
-        acc += __half2float(weights[row * K + col]) * __half2float(input[col]);
-    }
-    output[row] = __float2half(acc);
-}
 
 void test_pack_unpack() {
     printf("Test 1: 2-bit Pack/Unpack\n");
@@ -870,7 +716,7 @@ void test_full_quantization_pipeline() {
     cudaMalloc(&d_group_max, num_groups * sizeof(float));
     cudaMalloc(&d_group_precision, num_groups * sizeof(uint8_t));
     cudaMalloc(&d_packed_2bit, M * num_groups * sizeof(uint32_t));
-    cudaMalloc(&d_packed_4bit, M * num_groups * sizeof(uint32_t));
+    cudaMalloc(&d_packed_4bit, M * num_groups * 2 * sizeof(uint32_t));
     cudaMalloc(&d_scales_1st, M * num_groups * sizeof(half));
     cudaMalloc(&d_zeros_1st, M * num_groups * sizeof(int8_t));
     cudaMalloc(&d_outlier_mask, M * K * sizeof(int));
@@ -931,96 +777,9 @@ void test_full_quantization_pipeline() {
     cudaFree(d_outlier_mask);
 }
 
-void test_gemv_performance() {
-    printf("Test 5: GEMV Performance Benchmark\n");
-    
-    const int M = 4096;
-    const int K = 4096;
-    const int WARMUP = 10;
-    const int ITERATIONS = 100;
-    
-    printf("  Matrix: %d x %d\n", M, K);
-    
-    // Allocate for FP16 baseline
-    half *d_weights_fp16, *d_input, *d_output_fp16;
-    cudaMalloc(&d_weights_fp16, M * K * sizeof(half));
-    cudaMalloc(&d_input, K * sizeof(half));
-    cudaMalloc(&d_output_fp16, M * sizeof(half));
-    
-    // Benchmark FP16 GEMV
-    int block_size = 256;
-    int grid_size = (M + block_size - 1) / block_size;
-    
-    for (int i = 0; i < WARMUP; i++) {
-        reference_gemv_kernel<<<grid_size, block_size>>>(d_weights_fp16, d_input, d_output_fp16, M, K);
-    }
-    cudaDeviceSynchronize();
-    
-    auto start_fp16 = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < ITERATIONS; i++) {
-        reference_gemv_kernel<<<grid_size, block_size>>>(d_weights_fp16, d_input, d_output_fp16, M, K);
-    }
-    cudaDeviceSynchronize();
-    auto end_fp16 = std::chrono::high_resolution_clock::now();
-    double ms_fp16 = std::chrono::duration<double, std::milli>(end_fp16 - start_fp16).count() / ITERATIONS;
-    
-    // Allocate for quantized
-    half* d_output_quant;
-    cudaMalloc(&d_output_quant, M * sizeof(half));
-    
-    memboost::QuantizedTensor qtensor;
-    memboost::allocate_quantized_tensor(&qtensor, M, K);
-    
-    std::vector<uint8_t> precision(qtensor.weights.num_groups, 0);
-    cudaMemcpy(qtensor.weights.group_precision, precision.data(), 
-               precision.size() * sizeof(uint8_t), cudaMemcpyHostToDevice);
-    
-    // Warmup quantized
-    for (int i = 0; i < WARMUP; i++) {
-        memboost::async_dequant_gemv(&qtensor, d_input, d_output_quant, M, K, 0);
-    }
-    cudaDeviceSynchronize();
-    
-    // Benchmark quantized
-    auto start_quant = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < ITERATIONS; i++) {
-        memboost::async_dequant_gemv(&qtensor, d_input, d_output_quant, M, K, 0);
-    }
-    cudaDeviceSynchronize();
-    auto end_quant = std::chrono::high_resolution_clock::now();
-    double ms_quant = std::chrono::duration<double, std::milli>(end_quant - start_quant).count() / ITERATIONS;
-    
-    // Calculate memory and bandwidth
-    double fp16_bytes = (double)(M * K * 2 + K * 2 + M * 2); // weights + input + output
-    double quant_bytes = (double)(M * K * 0.25 + K * 2 + M * 2); // ~2-bit weights + input + output
-    
-    double fp16_bandwidth = (fp16_bytes / (1024.0 * 1024.0 * 1024.0)) / (ms_fp16 / 1000.0);
-    double quant_bandwidth = (quant_bytes / (1024.0 * 1024.0 * 1024.0)) / (ms_quant / 1000.0);
-    
-    printf("\n  FP16 GEMV:\n");
-    printf("    Time: %.3f ms\n", ms_fp16);
-    printf("    Memory: %.2f MB\n", fp16_bytes / (1024.0 * 1024.0));
-    printf("    Bandwidth: %.2f GB/s\n", fp16_bandwidth);
-    
-    printf("\n  Quantized GEMV (2-bit):\n");
-    printf("    Time: %.3f ms\n", ms_quant);
-    printf("    Memory: %.2f MB (%.1fx reduction)\n", quant_bytes / (1024.0 * 1024.0), fp16_bytes / quant_bytes);
-    printf("    Bandwidth: %.2f GB/s\n", quant_bandwidth);
-    
-    printf("\n  Speedup: %.2fx\n", ms_fp16 / ms_quant);
-    printf("  Result: PASSED\n\n");
-    
-    // Cleanup
-    cudaFree(d_weights_fp16);
-    cudaFree(d_input);
-    cudaFree(d_output_fp16);
-    cudaFree(d_output_quant);
-    memboost::free_quantized_tensor(&qtensor);
-}
-
 int main() {
     printf("Testing the 2-bit Quantization Cuda Implementation\n\n");
-    
+
     int device;
     cudaGetDevice(&device);
     cudaDeviceProp prop;
@@ -1028,13 +787,12 @@ int main() {
     printf("GPU: %s\n", prop.name);
     printf("Compute Capability: %d.%d\n", prop.major, prop.minor);
     printf("Memory: %.2f GB\n\n", prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
-    
+
     test_pack_unpack();
     test_4bit_pack_unpack();
     test_group_stats_kernel();
     test_full_quantization_pipeline();
-    test_gemv_performance();
-    
+
     printf("\nDone\n");
     return 0;
 }

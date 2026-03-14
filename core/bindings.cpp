@@ -4,7 +4,7 @@
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "Memboost: 2-bit quantization CUDA kernels for LLM inference";
+    m.doc() = "Memboost: mixed-precision 2/4-bit weight quantization engine";
 
     // Pack / Unpack
     m.def("pack_2bit", &memboost::pack_2bit_op,

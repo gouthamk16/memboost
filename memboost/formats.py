@@ -17,25 +17,25 @@ class QuantizedTensor:
     """
 
     # Core packed weights — int32 because torch has no uint32
-    packed_2bit: torch.Tensor          # [M, num_groups] int32
-    packed_4bit: torch.Tensor          # [M, num_groups] int32
+    packed_2bit: torch.Tensor  # [M, num_groups] int32
+    packed_4bit: torch.Tensor  # [M, num_groups * 2] int32 (2 uint32 per 4-bit group)
 
     # 1st-order quantization parameters
-    scales_1st: torch.Tensor           # [M, num_groups] fp16
-    zeros_1st: torch.Tensor            # [M, num_groups] int8
+    scales_1st: torch.Tensor  # [M, num_groups] fp16
+    zeros_1st: torch.Tensor  # [M, num_groups] int8
 
     # 2nd-order quantization parameters (scales of scales)
-    scales_2nd: torch.Tensor           # [num_groups_2nd] fp16
-    zeros_2nd: torch.Tensor            # [num_groups_2nd] int8
-    scales_1st_quant: torch.Tensor     # [M, num_groups] uint8
+    scales_2nd: torch.Tensor  # [num_groups_2nd] fp16
+    zeros_2nd: torch.Tensor  # [num_groups_2nd] int8
+    scales_1st_quant: torch.Tensor  # [M, num_groups] uint8
 
     # Per-group precision map: 0 = 2-bit, 1 = 4-bit
-    group_precision: torch.Tensor      # [num_groups] uint8
+    group_precision: torch.Tensor  # [num_groups] uint8
 
     # Sparse outliers in CSR format
-    outlier_values: torch.Tensor       # [nnz] fp16
+    outlier_values: torch.Tensor  # [nnz] fp16
     outlier_col_indices: torch.Tensor  # [nnz] int32
-    outlier_row_ptrs: torch.Tensor     # [M+1] int32
+    outlier_row_ptrs: torch.Tensor  # [M+1] int32
 
     # Original dimensions
     M: int = 0

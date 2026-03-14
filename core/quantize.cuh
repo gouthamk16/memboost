@@ -2,7 +2,6 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cusparse.h>
 #include <cstdint>
 
 namespace memboost {
@@ -96,22 +95,6 @@ cudaError_t compute_group_sensitivity(
     const float* hessian_inv,
     float* sensitivity,
     int M, int K,
-    cudaStream_t stream = 0
-);
-
-cudaError_t async_dequant_gemv(
-    const QuantizedTensor* weights,
-    const half* input,
-    half* output,
-    int M, int K,
-    cudaStream_t stream = 0
-);
-
-cudaError_t sparse_outlier_gemv(
-    cusparseHandle_t handle,
-    const SparseOutliers* outliers,
-    const half* input,
-    half* output,
     cudaStream_t stream = 0
 );
 

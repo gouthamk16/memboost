@@ -129,7 +129,7 @@ std::vector<torch::Tensor> quantize_op(
     auto group_max       = torch::empty({num_groups}, opts_f32);
     auto group_precision = torch::zeros({num_groups}, opts_u8);
     auto packed_2bit     = torch::zeros({M, num_groups}, opts_i32);
-    auto packed_4bit     = torch::zeros({M, num_groups}, opts_i32);
+    auto packed_4bit     = torch::zeros({M, num_groups * 2}, opts_i32);
     auto scales_1st      = torch::empty({M, num_groups}, opts_f16);
     auto zeros_1st       = torch::empty({M, num_groups}, opts_i8);
     auto outlier_mask    = torch::zeros({M, K}, opts_i32);

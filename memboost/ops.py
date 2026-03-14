@@ -113,9 +113,10 @@ def dequantize(qtensor: QuantizedTensor) -> torch.Tensor:
     scales and zeros stored in the :class:`QuantizedTensor`.
 
     .. note::
-        This does **not** add back sparse outliers. Use
-        :func:`dequantize_with_outliers` for full reconstruction (coming
-        soon).
+        This does **not** add back sparse outliers. The outlier values
+        are available in ``qtensor.outlier_values`` /
+        ``qtensor.outlier_col_indices`` / ``qtensor.outlier_row_ptrs``
+        for manual reconstruction if needed.
 
     Args:
         qtensor: A :class:`QuantizedTensor` on CUDA.
