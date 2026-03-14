@@ -50,10 +50,19 @@ class QuantizedTensor:
         return self.outlier_values.numel()
 
     @property
+    def num_2bit_groups(self) -> int:
+        return int((self.group_precision == 0).sum().item())
+
+    @property
+    def num_4bit_groups(self) -> int:
+        return int((self.group_precision == 1).sum().item())
+
+    @property
     def avg_bits(self) -> float:
         """Approximate average bits per weight element."""
-        n2 = int((self.group_precision == 0).sum().item()) * GROUP_SIZE_1ST
-        n4 = int((self.group_precision == 1).sum().item()) * GROUP_SIZE_1ST
+        # Each column group spans all M rows
+        n2 = self.num_2bit_groups * GROUP_SIZE_1ST * self.M
+        n4 = self.num_4bit_groups * GROUP_SIZE_1ST * self.M
         total = self.M * self.K
         if total == 0:
             return 0.0
@@ -64,7 +73,30 @@ class QuantizedTensor:
 
     @property
     def total_bytes(self) -> int:
-        """Exact total memory footprint in bytes across all stored tensors."""
+        """Effective memory footprint in bytes (excludes unused packed storage)."""
+        # packed_2bit/packed_4bit are allocated at full size but only
+        # groups matching their precision contain data
+        n2g = self.num_2bit_groups
+        n4g = self.num_4bit_groups
+        packed_2bit_used = n2g * self.M * 4   # 1 int32 per 2-bit group per row
+        packed_4bit_used = n4g * self.M * 8   # 2 int32 per 4-bit group per row
+        return (
+            packed_2bit_used
+            + packed_4bit_used
+            + self.scales_1st.nbytes
+            + self.zeros_1st.nbytes
+            + self.scales_2nd.nbytes
+            + self.zeros_2nd.nbytes
+            + self.scales_1st_quant.nbytes
+            + self.group_precision.nbytes
+            + self.outlier_values.nbytes
+            + self.outlier_col_indices.nbytes
+            + self.outlier_row_ptrs.nbytes
+        )
+
+    @property
+    def gpu_bytes(self) -> int:
+        """Actual GPU memory allocated (includes unused packed storage)."""
         return (
             self.packed_2bit.nbytes
             + self.packed_4bit.nbytes
@@ -81,14 +113,16 @@ class QuantizedTensor:
 
     @property
     def total_mb(self) -> float:
-        """Exact total memory footprint in megabytes."""
+        """Effective memory footprint in megabytes."""
         return self.total_bytes / (1024 * 1024)
 
     def memory_breakdown(self) -> dict[str, float]:
         """Return per-component memory usage in MiB for debugging."""
+        n2g = self.num_2bit_groups
+        n4g = self.num_4bit_groups
         components = {
-            "packed_2bit": self.packed_2bit.nbytes,
-            "packed_4bit": self.packed_4bit.nbytes,
+            "packed_2bit": n2g * self.M * 4,
+            "packed_4bit": n4g * self.M * 8,
             "scales_1st": self.scales_1st.nbytes,
             "zeros_1st": self.zeros_1st.nbytes,
             "scales_2nd": self.scales_2nd.nbytes,
@@ -103,6 +137,9 @@ class QuantizedTensor:
         for name, size in sorted(mib.items(), key=lambda x: -x[1]):
             print(f"  {name:25s} {size:8.3f} MiB")
         print(f"  {'TOTAL':25s} {sum(mib.values()):8.3f} MiB")
+        gpu_mib = self.gpu_bytes / (1024 * 1024)
+        if gpu_mib > sum(mib.values()) + 0.001:
+            print(f"  {'GPU allocated':25s} {gpu_mib:8.3f} MiB")
         return mib
 
     @property
